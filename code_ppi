@@ -1,0 +1,149 @@
+###############################################
+# PPI-Graphomer (PPI-Graghomer) — Set1 (25 pairs)
+# MSU HPCC / bolt2_2GJJ_screen workflow
+# Single copy/paste script: install env + preprocess + infer + collect CSV
+###############################################
+
+# ====== 0) Paths you MUST edit if different ======
+# Main working dir (your existing project)
+BASE="/mnt/gs21/scratch/$USER/bolt2_2GJJ_screen"
+
+# Repo location (you already have it)
+REPO="$BASE/software/PPI-Graphomer"
+
+# Where your 25 complex PDBs live (these are your pair_XX_YYYY.pdb files)
+# Example from your earlier run: prodigy_run/pdb/
+PDB_DIR="$BASE/prodigy_run/pdb"
+
+# Output run directory
+RUN="$BASE/ppi_graphomer_run_set1_final"
+
+# ====== 1) Load modules + activate env ======
+module purge
+module load Miniforge3
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# If env already exists, activate it. Otherwise create it (GPU-friendly torch + py39).
+# NOTE: If you already created "ppi-graphomer", skip the create step.
+if conda env list | awk '{print $1}' | grep -qx "ppi-graphomer"; then
+  conda activate ppi-graphomer
+else
+  conda create -y -n ppi-graphomer python=3.9 pip
+  conda activate ppi-graphomer
+
+  # Torch CUDA 12.1 (matches the wheels you installed)
+  pip install --upgrade pip
+  pip install "torch==2.1.2+cu121" "torchvision==0.16.2+cu121" "torchaudio==2.1.2+cu121" --index-url https://download.pytorch.org/whl/cu121
+
+  # Core deps (safe set; repo also has requirements.txt)
+  pip install -r "$REPO/requirements.txt" || true
+
+  # PyG packages (must match torch+cu121)
+  pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.1.0%2Bcu121.html
+
+  # torch_geometric (works with above)
+  pip install torch_geometric
+fi
+
+# Quick sanity checks
+python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
+python -c "import torch_scatter, torch_geometric; print('torch_scatter OK'); print('torch_geometric OK', torch_geometric.__version__)"
+
+# ====== 2) Create run folders ======
+mkdir -p "$RUN"/{work,logs,out}
+mkdir -p "$RUN/work/preprocessed" "$RUN/out/raw"
+
+# ====== 3) Build a 25-PDB batch CSV from your directory ======
+# This grabs pair_*.pdb and limits to first 25 in sorted order.
+# If you want EXACTLY your prior 25, replace this with a fixed list.
+python - <<'PY'
+import os, glob, csv
+BASE=os.environ["PDB_DIR"]
+out_csv=os.path.join(os.environ["RUN"],"work","batch_set1.csv")
+pdbs=sorted(glob.glob(os.path.join(BASE,"pair_*.pdb")))[:25]
+if not pdbs:
+    raise SystemExit(f"No pair_*.pdb found in {BASE}")
+with open(out_csv,"w",newline="") as f:
+    w=csv.writer(f)
+    w.writerow(["pair_id","pdb_path"])
+    for p in pdbs:
+        pid=os.path.splitext(os.path.basename(p))[0]
+        w.writerow([pid,p])
+print("WROTE:", out_csv)
+print("COUNT:", len(pdbs))
+print("FIRST5:", [os.path.basename(x) for x in pdbs[:5]])
+PY
+
+# ====== 4) Preprocess (GPU) ======
+# IMPORTANT: preprocess_gpu.py DOES NOT take --input_csv. It expects --pdb_folder or --pdb_folder + save_dir.
+# We’ll preprocess by copying only the 25 PDBs into a temp folder and pointing --pdb_folder at it.
+mkdir -p "$RUN/work/pdb_25"
+python - <<'PY'
+import os, csv, shutil
+RUN=os.environ["RUN"]
+batch=os.path.join(RUN,"work","batch_set1.csv")
+dst=os.path.join(RUN,"work","pdb_25")
+os.makedirs(dst, exist_ok=True)
+with open(batch) as f:
+    r=csv.DictReader(f)
+    rows=list(r)
+for row in rows:
+    shutil.copy2(row["pdb_path"], os.path.join(dst, os.path.basename(row["pdb_path"])))
+print("Copied", len(rows), "PDBs into", dst)
+PY
+
+# Run preprocess
+python "$REPO/preprocess_gpu.py" \
+  --pdb_folder "$RUN/work/pdb_25" \
+  --save_dir "$RUN/work/preprocessed" \
+  --workers 4
+
+# ====== 5) Pick pretrained checkpoint (OBVIOUS choice) ======
+# We are using the pretrained checkpoint distributed with the repo.
+CKPT="$(ls -1 "$REPO"/model/*.pth 2>/dev/null | head -n 1 || true)"
+if [[ -z "$CKPT" ]]; then
+  echo "ERROR: No checkpoint found in $REPO/model/*.pth"
+  ls -lah "$REPO/model" || true
+  exit 2
+fi
+echo "USING CHECKPOINT: $CKPT"
+
+# ====== 6) Inference for each PDB (loop) ======
+# inference.py usage per your screenshot: inference.py --pdb PDB
+# We run one-by-one, save raw outputs, then parse "predict affinity: X" into predictions.csv.
+
+# Clean old outputs
+rm -f "$RUN/out/predictions.csv"
+echo "pair_id,score,raw_file" > "$RUN/out/predictions.csv"
+
+# Run inference + capture output
+for pdb in "$RUN/work/pdb_25"/pair_*.pdb; do
+  pid="$(basename "$pdb" .pdb)"
+  raw="$RUN/out/raw/${pid}.txt"
+
+  # Run
+  python "$REPO/inference.py" --pdb "$pdb" > "$raw" 2>&1 || true
+
+  # Extract score from the raw file line that looks like: "predict affinity: 11.67"
+  score="$(grep -Eo 'predict affinity:\s*[-+]?[0-9]*\.?[0-9]+' "$raw" | tail -n 1 | awk '{print $3}')"
+
+  # If missing, leave blank so you can inspect raw logs
+  echo "${pid},${score},${raw}" >> "$RUN/out/predictions.csv"
+
+  echo "DONE $pid score=$score"
+done
+
+echo "=== DONE ==="
+echo "Wrote: $RUN/out/predictions.csv"
+wc -l "$RUN/out/predictions.csv" || true
+
+# ====== 7) Rank outputs (desc/asc) ======
+(head -n 1 "$RUN/out/predictions.csv" && tail -n +2 "$RUN/out/predictions.csv" | sort -t, -k2,2nr) > "$RUN/out/predictions_ranked_desc.csv"
+(head -n 1 "$RUN/out/predictions.csv" && tail -n +2 "$RUN/out/predictions.csv" | sort -t, -k2,2n ) > "$RUN/out/predictions_ranked_asc.csv"
+
+echo "Wrote:"
+echo "  $RUN/out/predictions_ranked_desc.csv"
+echo "  $RUN/out/predictions_ranked_asc.csv"
+
+# ====== 8) Quick preview ======
+(head -n 1 "$RUN/out/predictions.csv" && tail -n +2 "$RUN/out/predictions.csv" | sort -t, -k2,2nr | head -n 15) | column -t -s,
